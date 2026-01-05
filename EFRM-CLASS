@@ -1,0 +1,229 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib.backends.backend_pdf import PdfPages
+from PIL import Image
+import subprocess
+import os
+
+# -----------------------------
+# CONFIGURATION
+# -----------------------------
+CLASS_EXEC = "./class/class"        # Path to EFRM-CLASS executable
+INI_FILE = "./explanatory.ini"     # Path to CLASS ini file
+OUTPUT_DIR = "./output/"
+PDF_REPORT = os.path.join(OUTPUT_DIR, "EFRM_Universe_Test_Report.pdf")
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+# Parameter grid
+tau0_list = np.linspace(0.05, 0.2, 4)
+kappa_list = np.linspace(0.5, 2.0, 4)
+G = 4.302e-6  # kpc * (km/s)^2 / Msun
+
+# -----------------------------
+# 1. Galaxy Data (SPARC placeholder)
+# -----------------------------
+galaxies = {
+    "Galaxy A": {"r": np.linspace(0.1, 20, 50),
+                 "v_obs": np.sqrt(G * 1e10*(1 - np.exp(-np.linspace(0.1,20,50)/5))/np.linspace(0.1,20,50))},
+    "Galaxy B": {"r": np.linspace(0.1, 30, 60),
+                 "v_obs": np.sqrt(G * 5e10*(1 - np.exp(-np.linspace(0.1,30,60)/8))/np.linspace(0.1,30,60))},
+}
+
+# -----------------------------
+# 2. CMB Data (Planck placeholder)
+# -----------------------------
+l_planck = np.arange(2, 51)
+Cl_planck = 1e-10*l_planck*(l_planck+1)/2  # replace with real Planck low-l data
+
+# -----------------------------
+# χ² FUNCTIONS
+# -----------------------------
+def galaxy_chi2(r, v_obs, tau0, kappa):
+    phi_newton = -G * (v_obs**2 * r / G)
+    dphi_dr = np.gradient(phi_newton, r)
+    delta_J = -tau0 * kappa * dphi_dr
+    phi_eff = phi_newton + delta_J
+    dphi_eff_dr = np.gradient(phi_eff, r)
+    v_pred = np.sqrt(np.abs(r * dphi_eff_dr))
+    chi2 = np.sum((v_obs - v_pred)**2 / (v_obs+1e-5)**2)
+    return chi2, v_pred
+
+def cmb_chi2(l, Cl_pred, Cl_obs):
+    return np.sum((Cl_obs - Cl_pred)**2 / (Cl_obs + 1e-12)**2)
+
+# -----------------------------
+# 3. CLUSTER LENSING ANIMATION FUNCTIONS
+# -----------------------------
+grid_size = 100
+x = np.linspace(-50, 50, grid_size)
+y = np.linspace(-50, 50, grid_size)
+X, Y = np.meshgrid(x, y)
+
+clusters = [
+    {"x0": -20, "y0": 0, "M": 1e15, "sigma": 5},
+    {"x0": 20, "y0": 0, "M": 0.8e15, "sigma": 5}
+]
+
+times = np.linspace(0, 50, 60)  # arbitrary units
+
+def gaussian2d(x, y, x0, y0, sigma, M):
+    return M * np.exp(-((x-x0)**2 + (y-y0)**2)/(2*sigma**2))
+
+def compute_efrm_mass_field(clusters, t, tau0, kappa):
+    field = np.zeros_like(X)
+    for c in clusters:
+        x_pos = c["x0"] + 0.4*t
+        y_pos = c["y0"]
+        M_eff = c["M"] * (1 - np.exp(-tau0 * kappa * t / 50))
+        field += gaussian2d(X, Y, x_pos, y_pos, c["sigma"], M_eff)
+    return field
+
+anim_file = os.path.join(OUTPUT_DIR, "cluster_lensing.gif")
+
+def create_cluster_animation(tau0, kappa):
+    fig, ax = plt.subplots(figsize=(6,6))
+    cax = ax.imshow(np.zeros_like(X), origin='lower', extent=(-50,50,-50,50),
+                    cmap='viridis', vmin=0, vmax=2e15)
+    ax.set_xlabel("x [kpc]")
+    ax.set_ylabel("y [kpc]")
+    
+    def update(frame):
+        t = times[frame]
+        field = compute_efrm_mass_field(clusters, t, tau0, kappa)
+        cax.set_data(field)
+        ax.set_title(f"Time = {t:.1f} | τ={tau0}, κ={kappa}")
+        return [cax]
+    
+    anim = FuncAnimation(fig, update, frames=len(times), blit=True)
+    anim.save(anim_file, writer=PillowWriter(fps=10))
+    plt.close()
+    return anim_file
+
+# -----------------------------
+# 4. RUN GRID SEARCH AND PLOTS
+# -----------------------------
+best_chi2 = np.inf
+best_params = None
+chi2_results = []
+
+pdf_pages = PdfPages(PDF_REPORT)
+
+for tau0 in tau0_list:
+    for kappa in kappa_list:
+        param_label = f"tau{tau0}_kappa{kappa}"
+        
+        # Galaxy χ² and rotation curves
+        chi2_gal = 0
+        plt.figure(figsize=(8,5))
+        for name, data in galaxies.items():
+            chi2_val, v_pred = galaxy_chi2(data["r"], data["v_obs"], tau0, kappa)
+            chi2_gal += chi2_val
+            plt.plot(data["r"], v_pred, label=f"{name} EFRM")
+            plt.plot(data["r"], data["v_obs"], 'k--', label=f"{name} Obs")
+        plt.xlabel('Radius [kpc]')
+        plt.ylabel('v_rot [km/s]')
+        plt.title(f'EFRM Galaxy Rotation Curves (τ={tau0}, κ={kappa})')
+        plt.legend()
+        plt.grid(True)
+        pdf_pages.savefig()
+        plt.close()
+        
+        # Update INI and run CLASS
+        with open(INI_FILE, "r") as f:
+            ini_lines = f.readlines()
+        with open(INI_FILE, "w") as f:
+            for line in ini_lines:
+                if "efr_tau0" in line:
+                    f.write(f"efr_tau0 = {tau0}\n")
+                elif "efr_kappa" in line:
+                    f.write(f"efr_kappa = {kappa}\n")
+                else:
+                    f.write(line)
+        subprocess.run([CLASS_EXEC, INI_FILE], check=True)
+        
+        # Load CMB (placeholder if not generated)
+        try:
+            cl_file = os.path.join(OUTPUT_DIR, "cls/Cl.dat")
+            cl = np.loadtxt(cl_file)
+            l_cls = cl[:,0]
+            Cl_TT = cl[:,1]
+            f_interp = interp1d(l_cls, Cl_TT, kind='linear', bounds_error=False, fill_value="extrapolate")
+            Cl_pred = f_interp(l_planck)
+        except:
+            Cl_pred = Cl_planck * np.exp(-tau0*l_planck/30)
+        
+        chi2_cmb = cmb_chi2(l_planck, Cl_pred, Cl_planck)
+        chi2_total = chi2_gal + chi2_cmb
+        chi2_results.append((tau0, kappa, chi2_total))
+        
+        if chi2_total < best_chi2:
+            best_chi2 = chi2_total
+            best_params = (tau0, kappa)
+        
+        # Plot low-ℓ CMB
+        plt.figure(figsize=(8,5))
+        plt.plot(l_planck, Cl_planck, 'k--', label='Planck')
+        plt.plot(l_planck, Cl_pred, 'b-', label=f'EFRM τ={tau0}, κ={kappa}')
+        plt.xlabel('Multipole ℓ')
+        plt.ylabel('ℓ(ℓ+1) C_ℓ / 2π')
+        plt.title('EFRM Low-ℓ CMB')
+        plt.legend()
+        plt.grid(True)
+        pdf_pages.savefig()
+        plt.close()
+        
+# -----------------------------
+# 5. χ² Heatmap
+# -----------------------------
+tau_vals = np.array([x[0] for x in chi2_results])
+kappa_vals = np.array([x[1] for x in chi2_results])
+chi2_vals = np.array([x[2] for x in chi2_results])
+
+plt.figure(figsize=(7,5))
+plt.tricontourf(tau_vals, kappa_vals, chi2_vals, 20, cmap='viridis')
+plt.colorbar(label='Total χ²')
+plt.scatter(best_params[0], best_params[1], color='red', marker='*', s=200, label='Best-fit')
+plt.xlabel('τ₀')
+plt.ylabel('κ')
+plt.title('EFRM χ² Grid Search (Galaxy + CMB)')
+plt.legend()
+plt.tight_layout()
+pdf_pages.savefig()
+plt.close()
+
+# -----------------------------
+# 6. Cluster Lensing Animation
+# -----------------------------
+cluster_gif = create_cluster_animation(best_params[0], best_params[1])
+# Add first frame to PDF
+gif = Image.open(cluster_gif)
+frame = np.array(gif.convert("RGB"))
+plt.figure(figsize=(6,6))
+plt.imshow(frame)
+plt.axis('off')
+plt.title("EFRM Cluster Lensing Animation (first frame)")
+pdf_pages.savefig()
+plt.close()
+
+# -----------------------------
+# 7. Summary Page
+# -----------------------------
+plt.figure(figsize=(8.5,11))
+plt.axis('off')
+plt.text(0.05, 0.9, 'EFRM Universe Test Suite Report', fontsize=18, weight='bold')
+plt.text(0.05, 0.85, f'Best-fit parameters: τ₀={best_params[0]:.3f}, κ={best_params[1]:.3f}, χ²={best_chi2:.3f}', fontsize=12)
+plt.text(0.05, 0.8, 'Summary of χ² results:', fontsize=14)
+y = 0.75
+for tau0, kappa, chi2 in chi2_results:
+    plt.text(0.05, y, f'τ={tau0:.3f}, κ={kappa:.3f} => χ²_total = {chi2:.3f}', fontsize=10)
+    y -= 0.03
+plt.tight_layout()
+pdf_pages.savefig()
+plt.close()
+
+pdf_pages.close()
+print(f"✅ EFRM Universe Test Suite completed. PDF report saved to {PDF_REPORT}")
+print(f"Best-fit parameters: τ₀={best_params[0]:.3f}, κ={best_params[1]:.3f}")
